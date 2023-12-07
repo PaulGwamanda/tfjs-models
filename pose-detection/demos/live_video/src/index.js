@@ -17,9 +17,10 @@
 
 import '@tensorflow/tfjs-backend-webgl';
 import '@tensorflow/tfjs-backend-webgpu';
-import * as mpPose from '@mediapipe/pose';
 
+import * as mpPose from '@mediapipe/pose';
 import * as tfjsWasm from '@tensorflow/tfjs-backend-wasm';
+import * as tf from '@tensorflow/tfjs-core';
 
 tfjsWasm.setWasmPaths(
     `https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@${
@@ -28,6 +29,8 @@ tfjsWasm.setWasmPaths(
 import * as posedetection from '@tensorflow-models/pose-detection';
 
 import {Camera} from './camera';
+import {RendererWebGPU} from './renderer_webgpu';
+import {RendererCanvas2d} from './renderer_canvas2d';
 import {setupDatGui} from './option_panel';
 import {STATE} from './params';
 import {setupStats} from './stats_panel';
@@ -37,6 +40,8 @@ let detector, camera, stats;
 let startInferenceTime, numInferences = 0;
 let inferenceTimeSum = 0, lastPanelUpdate = 0;
 let rafId;
+let renderer = null;
+let useGpuRenderer = false;
 
 async function createDetector() {
   switch (STATE.model) {
@@ -54,7 +59,8 @@ async function createDetector() {
         return posedetection.createDetector(STATE.model, {
           runtime,
           modelType: STATE.modelConfig.type,
-          solutionPath: `https://cdn.jsdelivr.net/npm/@mediapipe/pose@${mpPose.VERSION}`
+          solutionPath:
+              `https://cdn.jsdelivr.net/npm/@mediapipe/pose@${mpPose.VERSION}`
         });
       } else if (runtime === 'tfjs') {
         return posedetection.createDetector(
@@ -144,6 +150,7 @@ async function renderResult() {
   }
 
   let poses = null;
+  let canvasInfo = null;
 
   // Detector can be null if initialization failed (for example when loading
   // from a URL that does not exist).
@@ -151,12 +158,24 @@ async function renderResult() {
     // FPS only counts the time it takes to finish estimatePoses.
     beginEstimatePosesStats();
 
+    if (useGpuRenderer && STATE.model !== 'PoseNet') {
+      throw new Error('Only PoseNet supports GPU renderer!');
+    }
     // Detectors can throw errors, for example when using custom URLs that
     // contain a model that doesn't provide the expected output.
     try {
-      poses = await detector.estimatePoses(
-          camera.video,
-          {maxPoses: STATE.modelConfig.maxPoses, flipHorizontal: false});
+      if (useGpuRenderer) {
+        const [posesTemp, canvasInfoTemp] = await detector.estimatePosesGPU(
+            camera.video,
+            {maxPoses: STATE.modelConfig.maxPoses, flipHorizontal: false},
+            true);
+        poses = posesTemp;
+        canvasInfo = canvasInfoTemp;
+      } else {
+        poses = await detector.estimatePoses(
+            camera.video,
+            {maxPoses: STATE.modelConfig.maxPoses, flipHorizontal: false});
+      }
     } catch (error) {
       detector.dispose();
       detector = null;
@@ -165,15 +184,10 @@ async function renderResult() {
 
     endEstimatePosesStats();
   }
-
-  camera.drawCtx();
-
-  // The null check makes sure the UI is not in the middle of changing to a
-  // different model. If during model change, the result is from an old model,
-  // which shouldn't be rendered.
-  if (poses && poses.length > 0 && !STATE.isModelChanged) {
-    camera.drawResults(poses);
-  }
+  const rendererParams = useGpuRenderer ?
+      [camera.video, poses, canvasInfo, STATE.modelConfig.scoreThreshold] :
+      [camera.video, poses, STATE.isModelChanged];
+  renderer.draw(rendererParams);
 }
 
 async function renderPrediction() {
@@ -193,18 +207,32 @@ async function app() {
     alert('Cannot find model in the query string.');
     return;
   }
-
   await setupDatGui(urlParams);
 
   stats = setupStats();
+  const isWebGPU = STATE.backend === 'tfjs-webgpu';
+  const importVideo = (urlParams.get('importVideo') === 'true') && isWebGPU;
 
-  camera = await Camera.setupCamera(STATE.camera);
+  camera = await Camera.setup(STATE.camera);
 
   await setBackendAndEnvFlags(STATE.flags, STATE.backend);
-
+  await tf.ready();
   detector = await createDetector();
+  const canvas = document.getElementById('output');
+  canvas.width = camera.video.width;
+  canvas.height = camera.video.height;
+  useGpuRenderer = (urlParams.get('gpuRenderer') === 'true') && isWebGPU;
+  if (useGpuRenderer) {
+    renderer = new RendererWebGPU(canvas, importVideo);
+  } else {
+    renderer = new RendererCanvas2d(canvas);
+  }
 
   renderPrediction();
 };
 
 app();
+
+if (useGpuRenderer) {
+  renderer.dispose();
+}
